@@ -57,6 +57,10 @@ object CodegenPlugin extends sbt.AutoPlugin {
         "Tables that should be included. If this list is not nil, only the included tables minus excluded will be taken."
       )
 
+    lazy val slickCodegenIncludedSchemas: SettingKey[Seq[String]] = settingKey[Seq[String]](
+      "The list of schemas to generate files for. If nil, uses the JDBC URL as-is"
+    )
+
     lazy val defaultSourceCodeGenerator: m.Model => SourceCodeGenerator = (model: m.Model) =>
       new SourceCodeGenerator(model)
 
@@ -65,6 +69,56 @@ object CodegenPlugin extends sbt.AutoPlugin {
   }
 
   import autoImport._
+
+  implicit class CamelifiedString(val str: String) {
+    val useMapReduce: String => String = { spacedString =>
+      val first :: rest = spacedString.split(Array(' ', '_')).toList.map(_.toLowerCase)
+      val changedRest = rest.map(w => w.take(1).toUpperCase + w.drop(1))
+      val reunited = first :: changedRest
+      reunited.mkString
+    }
+
+    def camelCase(): String = useMapReduce(str)
+  }
+  private def wrappedGen(
+    generator: m.Model => SourceCodeGenerator,
+    driver: JdbcProfile,
+    jdbcDriver: String,
+    urlParam: String,
+    schemas: Seq[String],
+    user: String,
+    password: String,
+    outputDir: String,
+    pkgArg: String,
+    fileName: String,
+    outputToMultipleFiles: Boolean,
+    container: String,
+    excluded: Seq[String],
+    included: Seq[String],
+    s: TaskStreams): Seq[File] = {
+    if (schemas.nonEmpty && !urlParam.endsWith("/")) {
+      s.log.err("Schema list provided alongside URL without space for the schema name.")
+    }
+
+    if (schemas.isEmpty) {
+      gen(generator, driver,
+        jdbcDriver, urlParam, user, password, outputDir, pkgArg,
+        fileName, outputToMultipleFiles, container, excluded, included, s)
+    } else {
+
+      val files = for {
+        schema <- schemas
+      } yield {
+        val url = s"$urlParam$schema"
+        val pkg = s"$pkgArg.${schema.camelCase}"
+        s.log.info(s"Formatted URL is [$url]")
+        gen(generator, driver,
+          jdbcDriver, url, user, password, outputDir, pkg,
+          fileName, outputToMultipleFiles, container, excluded, included, s)
+      }
+      files.flatten
+    }
+  }
 
   private def gen(
     generator: m.Model => SourceCodeGenerator,
@@ -83,7 +137,9 @@ object CodegenPlugin extends sbt.AutoPlugin {
     s: TaskStreams
   ): Seq[File] = {
 
-    val database = driver.api.Database.forURL(url = url, driver = jdbcDriver, user = user, password = password)
+    val database = driver.api.Database.forURL(
+      url = url,
+      driver = jdbcDriver, user = user, password = password)
 
     try {
       database.source.createConnection().close()
@@ -154,6 +210,7 @@ object CodegenPlugin extends sbt.AutoPlugin {
     slickCodegenOutputContainer := "Tables",
     slickCodegenExcludedTables := Seq(),
     slickCodegenIncludedTables := Seq(),
+    slickCodegenIncludedSchemas := Seq(),
     slickCodegenCodeGenerator := defaultSourceCodeGenerator,
     slickCodegen := {
       val outDir = {
@@ -168,11 +225,12 @@ object CodegenPlugin extends sbt.AutoPlugin {
       val outPkg = (slickCodegenOutputPackage).value
       val outFile = (slickCodegenOutputFile).value
       val outputToMultipleFiles = slickCodegenOutputToMultipleFiles.value
-      gen(
+      wrappedGen(
         (slickCodegenCodeGenerator).value,
         (slickCodegenDriver).value,
         (slickCodegenJdbcDriver).value,
         (slickCodegenDatabaseUrl).value,
+        slickCodegenIncludedSchemas.value,
         (slickCodegenDatabaseUser).value,
         (slickCodegenDatabasePassword).value,
         outDir,
